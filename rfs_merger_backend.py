@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """RFS Merger Pro - local backend. Serves the UI at http://localhost:8000 and does the heavy merging."""
-import io, os, re, sys, shutil, socket, tempfile, threading, time, traceback, logging, webbrowser
+import gc, io, os, re, sys, shutil, socket, tempfile, threading, time, traceback, logging, webbrowser
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
@@ -16,6 +16,7 @@ for _stream in (sys.stdout, sys.stderr):
 import pandas as pd
 from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -25,6 +26,15 @@ BASE = Path(__file__).resolve().parent
 
 app = FastAPI(title="RFS Merger Pro")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# Arrow-backed strings use a fraction of the memory of plain Python strings,
+# which matters a lot on small cloud instances (e.g. Render's 512 MB).
+try:
+    import pyarrow  # noqa: F401
+    STR = "string[pyarrow]"
+except ImportError:
+    STR = "string"
 
 
 @app.exception_handler(Exception)
@@ -60,12 +70,17 @@ def read_file(path: Path) -> pd.DataFrame:
     if ext == ".csv":
         for enc in ("utf-8-sig", "cp1252", "latin-1"):
             try:
-                return pd.read_csv(path, dtype=str, keep_default_na=False, sep=None, engine="python", encoding=enc)
+                return pd.read_csv(path, dtype=str, keep_default_na=False, sep=None, engine="python",
+                                   encoding=enc).astype(STR)
             except UnicodeDecodeError:
                 continue
         raise ValueError("Cannot decode CSV")
-    engine = "pyxlsb" if ext == ".xlsb" else None
-    return pd.read_excel(path, dtype=str, keep_default_na=False, engine=engine)
+    try:
+        # calamine (Rust) is several times faster and far lighter than openpyxl
+        df = pd.read_excel(path, dtype=str, keep_default_na=False, engine="calamine")
+    except ImportError:
+        df = pd.read_excel(path, dtype=str, keep_default_na=False, engine="pyxlsb" if ext == ".xlsb" else None)
+    return df.astype(STR)
 
 
 def apply_filters(df: pd.DataFrame, filters) -> pd.DataFrame:
@@ -74,7 +89,7 @@ def apply_filters(df: pd.DataFrame, filters) -> pd.DataFrame:
         op = re.sub(r"[\s_-]", "", f.get("operator", "contains").lower())
         if col not in df.columns or not val:
             continue
-        s = df[col].astype(str).str.lower()
+        s = df[col].astype(STR).str.lower()
         if op in ("equals", "equal", "="):
             df = df[s == val]
         elif op in ("startswith", "starts"):
@@ -96,14 +111,17 @@ async def health():
     return {"status": "healthy", "files": len(S.files), "merged": S.df is not None}
 
 
+# Endpoints below are plain `def` so FastAPI runs them in a worker thread:
+# a long merge/export then can't freeze the server (and fail Render's health check).
 @app.post("/upload")
-async def upload(files: List[UploadFile] = File(...)):
+def upload(files: List[UploadFile] = File(...)):
     try:
         S.reset()
         for i, f in enumerate(files):
             name = re.sub(r"[^\w.\- ]", "_", Path(f.filename or f"file{i}").name)
             p = S.dir / f"{i}_{name}"
-            p.write_bytes(await f.read())
+            with open(p, "wb") as out:
+                shutil.copyfileobj(f.file, out, 1024 * 1024)
             S.files.append(p)
         return {"success": True, "file_count": len(S.files)}
     except Exception as e:
@@ -112,10 +130,11 @@ async def upload(files: List[UploadFile] = File(...)):
 
 
 @app.post("/merge")
-async def merge():
+def merge():
     try:
         if not S.files:
             raise ValueError("No files uploaded")
+        S.df = None
         frames, notes = [], []
         for p in S.files:
             try:
@@ -129,6 +148,8 @@ async def merge():
         if not frames:
             raise ValueError("No readable data found. " + "; ".join(notes))
         S.df = pd.concat(frames, ignore_index=True, sort=False).fillna("")
+        del frames
+        gc.collect()
         log.info("merged %d rows", len(S.df))
         return {"success": True, "row_count": len(S.df), "columns": list(S.df.columns), "notes": notes}
     except Exception as e:
@@ -136,8 +157,31 @@ async def merge():
         return JSONResponse({"success": False, "error": str(e)}, status_code=400)
 
 
+def write_xlsx(df: pd.DataFrame, out: Path, chunk: int = 100000) -> int:
+    """Stream rows straight to disk with xlsxwriter (constant memory)."""
+    import xlsxwriter
+    cols = list(df.columns)
+    n_sheets = max(1, -(-len(df) // chunk))
+    wb = xlsxwriter.Workbook(str(out), {"constant_memory": True})
+    ws = wb.add_worksheet("Summary")
+    for r, row in enumerate([("Item", "Value"), ("Total Rows", len(df)), ("Total Columns", len(cols)),
+                             ("Sheets", n_sheets), ("Export Date", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))]):
+        ws.write_row(r, 0, row)
+    for s in range(n_sheets):
+        ws = wb.add_worksheet(f"Data_{s + 1}" if n_sheets > 1 else "Data")
+        ws.write_row(0, 0, cols)
+        part = df.iloc[s * chunk:(s + 1) * chunk]
+        write = ws.write_string
+        for r, row in enumerate(zip(*(part[c].tolist() for c in cols)), 1):
+            for c, v in enumerate(row):
+                if v:
+                    write(r, c, v)
+    wb.close()
+    return n_sheets
+
+
 @app.post("/export")
-async def export(cfg: ExportConfig):
+def export(cfg: ExportConfig):
     try:
         if S.df is None:
             raise ValueError("Merge files first")
@@ -145,14 +189,7 @@ async def export(cfg: ExportConfig):
         cols = [c for c in (cfg.columns or list(df.columns)) if c in df.columns]
         df = df[cols]
         out = S.dir / "export.xlsx"
-        chunk = 100000
-        parts = [df.iloc[i:i + chunk] for i in range(0, len(df), chunk)] or [df]
-        with pd.ExcelWriter(out, engine="openpyxl") as w:
-            pd.DataFrame({"Item": ["Total Rows", "Total Columns", "Sheets", "Export Date"],
-                          "Value": [len(df), len(cols), len(parts), datetime.now().strftime("%Y-%m-%d %H:%M:%S")]}
-                         ).to_excel(w, sheet_name="Summary", index=False)
-            for i, part in enumerate(parts, 1):
-                part.to_excel(w, sheet_name=f"Data_{i}" if len(parts) > 1 else "Data", index=False)
+        write_xlsx(df, out)
         return FileResponse(out, filename=f"RFS_Merged_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
                             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     except Exception as e:
@@ -161,7 +198,7 @@ async def export(cfg: ExportConfig):
 
 
 @app.post("/reset")
-async def reset():
+def reset():
     S.reset()
     return {"status": "reset"}
 
