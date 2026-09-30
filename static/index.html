@@ -888,12 +888,19 @@ async function readSheet(file) {
   const ws = wb.Sheets[wb.SheetNames[0]];
   return XLSX.utils.sheet_to_json(ws, { defval: '', raw: false });
 }
+async function postJSON(url, opts) {
+  const res = await fetch(url, { method: 'POST', ...opts });
+  const text = await res.text();
+  try { return JSON.parse(text); } catch { throw new Error(`server returned ${res.status} ${res.statusText || ''} - it may have run out of memory or restarted`.trim()); }
+}
 async function backendMerge() {
   try {
     const fd = new FormData(); state.files.forEach(f => fd.append('files', f));
-    let d = await (await fetch('/upload', { method: 'POST', body: fd })).json();
+    addLog('Uploading files to server...');
+    let d = await postJSON('/upload', { body: fd });
     if (!d.success) throw new Error(d.error);
-    d = await (await fetch('/merge', { method: 'POST' })).json();
+    addLog('Upload done. Reading and merging on server...');
+    d = await postJSON('/merge');
     if (!d.success) throw new Error(d.error);
     (d.notes || []).forEach(n => addLog(n, /FAILED/.test(n) ? 'error' : 'success'));
     state.rows = []; state.columns = d.columns; state.selectedColumns = new Set(d.columns); state.filters = {};
@@ -997,7 +1004,7 @@ DOM.exportBtn.onclick = async () => {
     try {
       addLog('Preparing export...');
       const res = await fetch('/export', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ columns: state.columns.filter(c => state.selectedColumns.has(c)), filters: Object.values(state.filters).filter(f => String(f.value).trim()) }) });
-      if (!res.ok) throw new Error((await res.json()).error || res.statusText);
+      if (!res.ok) { const t = await res.text(); let m; try { m = JSON.parse(t).error; } catch { m = `server returned ${res.status}`; } throw new Error(m || res.statusText); }
       const url = URL.createObjectURL(await res.blob()), a = document.createElement('a');
       a.href = url; a.download = `RFS_Merged_${new Date().toISOString().slice(0, 10)}.xlsx`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 5000);
       addLog('✓ Export complete', 'success');
