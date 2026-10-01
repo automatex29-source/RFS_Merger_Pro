@@ -908,7 +908,13 @@ async function backendMerge() {
     for (let i = 0; i < n; i++) {
       const f = state.files[i];
       addLog(`[${i + 1}/${n}] Compressing ${f.name} (${MB(f.size)})...`);
-      const [blob, name] = await packFile(f);
+      let blob, name;
+      try { [blob, name] = await packFile(f); }
+      catch (err) {
+        // Chrome can't read a file that changed, is locked, or is a cloud placeholder since it was selected
+        addLog(`✗ Cannot read "${f.name}". It was changed, is open in another program (e.g. Excel), or is a OneDrive/Google Drive file that isn't on this PC. Close it (or copy it to a normal folder), click Clear, add the files again and retry.`, 'error');
+        return 'stop';
+      }
       addLog(`[${i + 1}/${n}] Uploading ${MB(blob.size)}...`);
       const fd = new FormData(); fd.append('files', blob, name);
       const u = await postJSON('/upload?append=1', { body: fd });
@@ -929,7 +935,9 @@ async function processMerge() {
   if (!state.files.length) return addLog('Select files first', 'error');
   state.processing = true; DOM.logs = []; renderFiles(); DOM.mergeBtn.disabled = true;
   addLog(`Starting merge of ${state.files.length} file(s)...`);
-  if (backend && await backendMerge()) { state.processing = false; DOM.mergeBtn.disabled = false; renderFiles(); return; }
+  const r = backend && await backendMerge();
+  if (r === 'stop') { state.processing = false; DOM.mergeBtn.disabled = false; renderFiles(); return; }
+  if (r) { state.processing = false; DOM.mergeBtn.disabled = false; renderFiles(); return; }
   const cols = [], seen = new Set(), rows = [];
   for (const f of state.files) {
     await tick();
