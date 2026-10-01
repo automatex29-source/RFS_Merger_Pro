@@ -786,6 +786,7 @@
 
                         <!-- Export Button -->
                         <button class="btn btn-success mt-3" id="export-btn" style="font-size: 1rem; padding: 1rem;">📥 Export to Excel</button>
+                        <button class="btn btn-secondary mt-3" id="export-csv-btn" style="font-size: 1rem; padding: 1rem;">📄 Export to CSV (fastest, best for big data)</button>
                     </div>
 
                     <!-- Summary Panel -->
@@ -893,18 +894,33 @@ async function postJSON(url, opts) {
   const text = await res.text();
   try { return JSON.parse(text); } catch { throw new Error(`server returned ${res.status} ${res.statusText || ''} - it may have run out of memory or restarted`.trim()); }
 }
+const MB = n => (n / 1048576).toFixed(1) + ' MB';
+// CSV/text compresses 5-10x, so gzip it in the browser before uploading.
+async function packFile(f) {
+  if (!/\.(csv|txt)$/i.test(f.name) || typeof CompressionStream === 'undefined') return [f, f.name];
+  const blob = await new Response(f.stream().pipeThrough(new CompressionStream('gzip'))).blob();
+  return [blob, f.name + '.gz'];
+}
 async function backendMerge() {
   try {
-    const fd = new FormData(); state.files.forEach(f => fd.append('files', f));
-    addLog('Uploading files to server...');
-    let d = await postJSON('/upload', { body: fd });
+    await fetch('/reset', { method: 'POST' });
+    const n = state.files.length;
+    for (let i = 0; i < n; i++) {
+      const f = state.files[i];
+      addLog(`[${i + 1}/${n}] Compressing ${f.name} (${MB(f.size)})...`);
+      const [blob, name] = await packFile(f);
+      addLog(`[${i + 1}/${n}] Uploading ${MB(blob.size)}...`);
+      const fd = new FormData(); fd.append('files', blob, name);
+      const u = await postJSON('/upload?append=1', { body: fd });
+      if (!u.success) throw new Error(u.error);
+      (u.notes || []).forEach(t => addLog(`[${i + 1}/${n}] ${t}`, /FAILED/.test(t) ? 'error' : 'success'));
+    }
+    addLog('All files uploaded. Merging...');
+    const d = await postJSON('/merge');
     if (!d.success) throw new Error(d.error);
-    addLog('Upload done. Reading and merging on server...');
-    d = await postJSON('/merge');
-    if (!d.success) throw new Error(d.error);
-    (d.notes || []).forEach(n => addLog(n, /FAILED/.test(n) ? 'error' : 'success'));
-    state.rows = []; state.columns = d.columns; state.selectedColumns = new Set(d.columns); state.filters = {};
-    addLog(`✓ Merged ${d.row_count} rows, ${d.columns.length} columns (backend)`, 'success');
+    state.rows = []; state.rowCount = d.row_count; state.columns = d.columns; state.selectedColumns = new Set(d.columns); state.filters = {};
+    addLog(`✓ Merged ${d.row_count.toLocaleString()} rows, ${d.columns.length} columns (backend)`, 'success');
+    if (d.row_count > 1000000) addLog('Tip: for this many rows, "Export to CSV" is much faster than Excel.', 'info');
     renderColumns(); renderFilters(); switchTab('filter'); return true;
   } catch (e) { addLog(`Backend failed (${e.message}). Using in-browser merge instead.`, 'warning'); backend = false; return false; }
 }
@@ -999,14 +1015,14 @@ function applyFilters(rows) {
     return f.operator === 'equals' ? v === q : f.operator === 'startswith' ? v.startsWith(q) : f.operator === 'endswith' ? v.endsWith(q) : v.includes(q);
   }));
 }
-DOM.exportBtn.onclick = async () => {
+async function doExport(format) {
   if (backend && state.columns.length && !state.rows.length) {
     try {
-      addLog('Preparing export...');
-      const res = await fetch('/export', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ columns: state.columns.filter(c => state.selectedColumns.has(c)), filters: Object.values(state.filters).filter(f => String(f.value).trim()) }) });
+      addLog(`Preparing ${format.toUpperCase()} export on server...`);
+      const res = await fetch('/export', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ format, columns: state.columns.filter(c => state.selectedColumns.has(c)), filters: Object.values(state.filters).filter(f => String(f.value).trim()) }) });
       if (!res.ok) { const t = await res.text(); let m; try { m = JSON.parse(t).error; } catch { m = `server returned ${res.status}`; } throw new Error(m || res.statusText); }
       const url = URL.createObjectURL(await res.blob()), a = document.createElement('a');
-      a.href = url; a.download = `RFS_Merged_${new Date().toISOString().slice(0, 10)}.xlsx`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 5000);
+      a.href = url; a.download = `RFS_Merged_${new Date().toISOString().slice(0, 10)}.${format}`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 5000);
       addLog('✓ Export complete', 'success');
     } catch (e) { addLog(`Export failed: ${e.message}`, 'error'); }
     return;
@@ -1017,6 +1033,12 @@ DOM.exportBtn.onclick = async () => {
   addLog('Preparing export...'); await tick();
   try {
     const out = applyFilters(state.rows);
+    if (format === 'csv') {
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([cols, ...out.map(r => cols.map(c => r[c] ?? ''))]), 'Data');
+      XLSX.writeFile(wb, `RFS_Merged_${new Date().toISOString().slice(0, 10)}.csv`, { bookType: 'csv' });
+      return addLog(`✓ Exported ${out.length} of ${state.rows.length} rows, ${cols.length} columns`, 'success');
+    }
     const aoa = [cols, ...out.map(r => cols.map(c => r[c] ?? ''))];
     const CH = 100000, wb = XLSX.utils.book_new();
     const summary = [['RFS Merger Pro - Export Summary'], [], ['Total Rows', out.length], ['Total Columns', cols.length], ['Export Date', new Date().toLocaleString()]];
@@ -1030,7 +1052,9 @@ DOM.exportBtn.onclick = async () => {
     XLSX.writeFile(wb, `RFS_Merged_${new Date().toISOString().slice(0, 10)}.xlsx`);
     addLog(`✓ Exported ${out.length} of ${state.rows.length} rows, ${cols.length} columns`, 'success');
   } catch (e) { addLog(`Export failed: ${e.message}`, 'error'); }
-};
+}
+DOM.exportBtn.onclick = () => doExport('xlsx');
+$('export-csv-btn').onclick = () => doExport('csv');
 updateStats();
 
 if (location.protocol.startsWith('http')) fetch('/health').then(r => { if (r.ok) { backend = true; addLog('Backend connected: fast mode', 'success'); } }).catch(() => {});
